@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+"""opencode-go-status — per-minute health check for OpenCode Go (deepseek-v4-flash).
+
+One self-contained script: run it as a monitor, or use --setup to install and
+configure it on any PC (copies itself to ~/.local/bin, stores the API key,
+registers a systemd user service, falls back to XDG autostart without systemd).
+
+Monitor mode (default):
+  Sends a minimal *streaming* chat completion to the OpenCode Go endpoint every
+  INTERVAL seconds and appends one JSONL status line to the log, recording
+  TTFB (first SSE byte), TTFT (first token), and total latency. Sends desktop
+  notifications (notify-send) on status changes; each notification REPLACES the
+  previous one, so only the latest stays visible.
+
+Setup mode:
+  opencode-go-status --setup install [--notify MODE] [--interval SEC] [...]
+      install/update config, API key, and startup registration
+  opencode-go-status --setup uninstall
+      remove startup registration (config + key kept)
+  opencode-go-status --setup status
+      show config, key state, service state, latest status
+  opencode-go-status --setup test-notify
+      send a test notification with the latest status
+  opencode-go-status --setup set-key
+      (re)set the OpenCode Go API key
+
+Config file (INI): ~/.config/opencode-go-status/config
+API key:           ~/.config/opencode-go-status/key  (mode 600, or
+                   $OPENCODE_GO_API_KEY, or the omp harness agent.db)
+Service unit:      ~/.config/systemd/user/opencode-go-status.service
+                   (fallback: ~/.config/autostart/opencode-go-status.desktop)
+
+Exit codes:
+  0  --once/--notify-now check succeeded (or clean shutdown in loop mode)
+  1  --once/--notify-now check failed
+  2  startup error (no API key, bad args)
+"""
+import argparse
+import configparser
+import getpass
+import http.client
+import json
+import os
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+APP = "opencode-go-status"
+DEFAULT_ENDPOINT = "https://opencode.ai/zen/go/v1/chat/completions"
+DEFAULT_MODEL = "deepseek-v4-flash"
+DEFAULT_LOG = os.path.expanduser("~/opencode-go-status.log")
+CONFIG_DIR = os.path.expanduser("~/.config/opencode-go-status")
+CONFIG = os.path.join(CONFIG_DIR, "config")
+KEY_FILE = os.path.join(CONFIG_DIR, "key")
+STATE_DIR = os.path.expanduser("~/.local/state/opencode-go-status")
+NOTIFY_ID_FILE = os.path.join(STATE_DIR, "notify-id")
+BIN = os.path.expanduser(f"~/.local/bin/{APP}")
+UNIT_NAME = f"{APP}.service"
+UNIT_PATH = os.path.expanduser(f"~/.config/systemd/user/{UNIT_NAME}")
+AUTOSTART_PATH = os.path.expanduser(f"~/.config/autostart/{APP}.desktop")
+PROMPT = "Reply with exactly: pong"
+KEY_DB = os.path.expanduser("~/.omp/agent/agent.db")
+
+BUILTIN = {
+    "interval": 60.0,
+    "timeout": 30.0,
+    "log": DEFAULT_LOG,
+    "endpoint": DEFAULT_ENDPOINT,
+    "model": DEFAULT_MODEL,
+    "notify": "change",
+}
+
+UNIT_TEMPLATE = """\
+[Unit]
+Description=OpenCode Go status monitor (deepseek-v4-flash)
+Documentation=https://opencode.ai/docs/go
+
+[Service]
+Type=simple
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+ExecStart={bin}
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+"""
+
+AUTOSTART_TEMPLATE = """\
+[Desktop Entry]
+Type=Application
+Name=OpenCode Go status monitor
+Comment=Per-minute health check for OpenCode Go (deepseek-v4-flash)
+Exec={bin}
+X-GNOME-Autostart-enabled=true
+"""
+
+
+# ---------------------------------------------------------------- config / key
+
+def load_api_key():
+    """Key from env, key file, then omp harness agent.db. None if unavailable."""
+    env_key = os.environ.get("OPENCODE_GO_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    try:
+        with open(KEY_FILE, encoding="utf-8") as fh:
+            key = fh.read().strip()
+        if key:
+            return key
+    except OSError:
+        pass
+    try:
+        con = sqlite3.connect(f"file:{KEY_DB}?mode=ro", uri=True)
+        row = con.execute(
+            "SELECT data FROM auth_credentials WHERE provider='opencode-go'"
+        ).fetchone()
+        con.close()
+        if row:
+            key = json.loads(row[0]).get("key")
+            if key:
+                return key
+    except Exception:  # noqa: BLE001 — harness DB may not exist on other PCs
+        pass
+    return None
+
+
+def save_api_key(key):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = KEY_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(key + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, KEY_FILE)
+    print(f"API key saved: {KEY_FILE} (mode 600)")
+
+
+def load_config(path):
+    cp = configparser.ConfigParser()
+    if os.path.isfile(path):
+        cp.read(path, encoding="utf-8")
+    if not cp.has_section("status"):
+        cp.add_section("status")
+    return cp
+
+
+def save_config(path, cp):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        cp.write(fh)
+
+
+# ------------------------------------------------------------------ monitor
+
+def parse_endpoint(endpoint):
+    scheme, rest = endpoint.split("://", 1)
+    host, _, path = rest.partition("/")
+    if not path.startswith("/"):
+        path = "/" + path
+    return scheme, host, path
+
+
+def check(endpoint, model, api_key, timeout):
+    """One streaming probe. Returns (status, detail_dict)."""
+    scheme, host, path = parse_endpoint(endpoint)
+    conn_cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+    conn = conn_cls(host, timeout=timeout)
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": PROMPT}],
+        "max_tokens": 8,
+        "temperature": 0,
+        "thinking": {"type": "disabled"},
+        "stream": True,
+    })
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": f"{APP}/3.0",
+    }
+    detail = {"http": None, "ttfb_ms": None, "ttft_ms": None,
+              "latency_ms": None, "reason": None}
+    t0 = time.monotonic()
+    reply_parts = []
+    usage = {}
+    finished = False
+    try:
+        conn.request("POST", path, body=body, headers=headers)
+        resp = conn.getresponse()
+        detail["http"] = resp.status
+        detail["ttfb_ms"] = round((time.monotonic() - t0) * 1000)
+        if resp.status != 200:
+            raw = resp.read().decode("utf-8", "replace").strip()
+            detail["latency_ms"] = round((time.monotonic() - t0) * 1000)
+            detail["reason"] = (raw[:300] + "…") if len(raw) > 300 else (raw or f"HTTP {resp.status}")
+            return "error", detail
+
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                finished = True
+                break
+            try:
+                chunk = json.loads(payload)
+            except ValueError:
+                continue
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            token = delta.get("content") or delta.get("reasoning_content")
+            if token:
+                if detail["ttft_ms"] is None:
+                    detail["ttft_ms"] = round((time.monotonic() - t0) * 1000)
+                reply_parts.append(token)
+            if choices[0].get("finish_reason"):
+                finished = True
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+        detail["latency_ms"] = round((time.monotonic() - t0) * 1000)
+    except (OSError, http.client.HTTPException) as exc:
+        detail["latency_ms"] = round((time.monotonic() - t0) * 1000)
+        detail["reason"] = f"{type(exc).__name__}: {exc}"
+        if not finished and not reply_parts:
+            return "error", detail
+        detail["reason"] = f"{detail['reason']} (partial reply)"
+        return "error", detail
+    finally:
+        conn.close()
+
+    reply = "".join(reply_parts).strip()
+    if not finished or not reply:
+        detail["reason"] = detail["reason"] or "stream ended without reply"
+        return "error", detail
+    detail.update({
+        "model": model,
+        "reply": reply,
+        "usage": {
+            "prompt": usage.get("prompt_tokens"),
+            "completion": usage.get("completion_tokens"),
+            "total": usage.get("total_tokens"),
+        },
+    })
+    return "ok", detail
+
+
+def now_iso():
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def read_last_status(log_path):
+    """Last status from the JSONL log, or None if unavailable."""
+    try:
+        with open(log_path, encoding="utf-8") as fh:
+            last = None
+            for last in fh:
+                pass
+        if last:
+            return json.loads(last).get("status")
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+# ------------------------------------------------------------- notifications
+
+_plain_fallback = [False]
+
+
+def read_notify_id():
+    try:
+        with open(NOTIFY_ID_FILE, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def send_notification(status, detail):
+    """Desktop notification that REPLACES the previous one (latest stays)."""
+    notify = shutil.which("notify-send")
+    if not notify:
+        sys.stderr.write("warning: notify-send not found; notification skipped\n")
+        return
+    lat = detail.get("latency_ms")
+    ttft = detail.get("ttft_ms")
+    model = detail.get("model") or DEFAULT_MODEL
+    if status == "ok":
+        urgency, title = "normal", f"{APP}: OK ({model})"
+        lat_s = f"latency={lat / 1000:.1f}s · " if lat is not None else ""
+        ttft_s = f"ttft={ttft / 1000:.1f}s · " if ttft is not None else ""
+        body = (lat_s + ttft_s +
+                f'http={detail.get("http")} · reply="{detail.get("reply")}"')
+    else:
+        urgency, title = "critical", f"{APP}: DOWN ({model})"
+        body = f'reason={detail.get("reason")} · http={detail.get("http")}'
+        if lat is not None:
+            body += f" · latency={lat / 1000:.1f}s"
+
+    cmd = [notify, "-a", APP, "-u", urgency]
+    if not _plain_fallback[0]:
+        cmd.append("--print-id")
+        prev = read_notify_id()
+        if prev:
+            cmd += ["-r", prev]
+    cmd += [title, body]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        sys.stderr.write(f"warning: notify-send failed: {exc}\n")
+        return
+    if res.returncode != 0:
+        err = res.stderr.strip()
+        if not _plain_fallback[0] and ("print-id" in err or "replace-id" in err
+                                       or "unknown option" in err):
+            # very old libnotify: fall back to stacking notifications
+            _plain_fallback[0] = True
+            sys.stderr.write("warning: notify-send lacks --print-id/-r; "
+                             "notifications will stack\n")
+            try:
+                subprocess.run([notify, "-a", APP, "-u", urgency, title, body],
+                               timeout=10, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        else:
+            sys.stderr.write(f"warning: notify-send failed: {err}\n")
+        return
+    nid = res.stdout.strip()
+    if nid.isdigit():
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(NOTIFY_ID_FILE, "w", encoding="utf-8") as fh:
+                fh.write(nid)
+        except OSError as exc:
+            sys.stderr.write(f"warning: cannot save notification id: {exc}\n")
+
+
+def run_monitor(opt, notify_mode, api_key, once, notify_now):
+    log_dir = os.path.dirname(os.path.abspath(opt["log"])) or "."
+    os.makedirs(log_dir, exist_ok=True)
+    sys.stdout.write(
+        f"{APP}: model={opt['model']} endpoint={opt['endpoint']} "
+        f"interval={opt['interval']:g}s notify={notify_mode} log={opt['log']}\n"
+    )
+    sys.stdout.flush()
+
+    prev_status = read_last_status(opt["log"])
+    while True:
+        status, detail = check(opt["endpoint"], opt["model"], api_key, opt["timeout"])
+        line = {"ts": now_iso(), "status": status, **detail}
+        with open(opt["log"], "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+        changed = prev_status is None or prev_status != status
+        if notify_now or notify_mode == "always" or (notify_mode == "change" and changed):
+            send_notification(status, detail)
+
+        parts = [line["ts"], status]
+        for k in ("http", "latency_ms", "ttft_ms", "ttfb_ms"):
+            if detail.get(k) is not None:
+                parts.append(f"{k}={detail[k]}ms" if k.endswith("_ms") else f"{k}={detail[k]}")
+        if detail.get("reply"):
+            parts.append(f'reply="{detail["reply"]}"')
+        if detail.get("reason"):
+            parts.append(f"reason={detail['reason']}")
+        print(" ".join(parts), flush=True)
+
+        prev_status = status
+        if once or notify_now:
+            return 0 if status == "ok" else 1
+        time.sleep(opt["interval"])
+
+
+# -------------------------------------------------------------------- setup
+
+def systemd_available():
+    if not shutil.which("systemctl"):
+        return False
+    res = subprocess.run(["systemctl", "--user", "is-system-running"],
+                         capture_output=True, text=True, timeout=15)
+    return res.stdout.strip() in ("running", "degraded", "starting")
+
+
+def systemctl(args, check=True):
+    return subprocess.run(["systemctl", "--user", *args],
+                          capture_output=True, text=True, check=check)
+
+
+def service_state():
+    active = systemctl(["is-active", UNIT_NAME], check=False).stdout.strip()
+    enabled = systemctl(["is-enabled", UNIT_NAME], check=False).stdout.strip()
+    pid = systemctl(["show", "-p", "MainPID", "--value", UNIT_NAME],
+                    check=False).stdout.strip()
+    return active, enabled, (int(pid) if pid.isdigit() else None)
+
+
+def stray_instances(service_pid):
+    out = subprocess.run(["pgrep", "-f", rf"\.local/bin/{APP}$"],
+                         capture_output=True, text=True, check=False)
+    pids = {int(p) for p in out.stdout.split() if p.strip()}
+    return pids - {service_pid}
+
+
+def prompt_api_key():
+    if not sys.stdin.isatty():
+        return None
+    try:
+        return getpass.getpass(
+            "OpenCode Go API key (https://opencode.ai/zen console): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+
+def register_startup():
+    """systemd user service, or XDG autostart fallback. Returns method name."""
+    if systemd_available():
+        os.makedirs(os.path.dirname(UNIT_PATH), exist_ok=True)
+        with open(UNIT_PATH, "w", encoding="utf-8") as fh:
+            fh.write(UNIT_TEMPLATE.format(bin=BIN))
+        systemctl(["daemon-reload"])
+        systemctl(["enable", "--now", UNIT_NAME])
+        return "systemd"
+    os.makedirs(os.path.dirname(AUTOSTART_PATH), exist_ok=True)
+    with open(AUTOSTART_PATH, "w", encoding="utf-8") as fh:
+        fh.write(AUTOSTART_TEMPLATE.format(bin=BIN))
+    return "autostart"
+
+
+def unregister_startup():
+    if systemd_available() and os.path.isfile(UNIT_PATH):
+        systemctl(["disable", "--now", UNIT_NAME], check=False)
+        os.remove(UNIT_PATH)
+        systemctl(["daemon-reload"])
+        return "systemd"
+    if os.path.isfile(AUTOSTART_PATH):
+        os.remove(AUTOSTART_PATH)
+        return "autostart"
+    return None
+
+
+def cmd_install(args):
+    # 1. self-install the binary so it works from any location
+    self_path = os.path.realpath(sys.argv[0])
+    if os.path.realpath(BIN) != self_path:
+        os.makedirs(os.path.dirname(BIN), exist_ok=True)
+        shutil.copy2(self_path, BIN)
+        os.chmod(BIN, 0o755)
+        print(f"installed: {BIN}")
+
+    # 2. persist config
+    cp = load_config(args.config)
+    for key in ("interval", "timeout", "log", "endpoint", "model", "notify"):
+        val = getattr(args, key, None)
+        if val is not None:
+            cp["status"][key] = str(val)
+    save_config(args.config, cp)
+    print(f"config: {args.config}")
+    for k, v in cp["status"].items():
+        print(f"  {k} = {v}")
+
+    # 3. API key: env -> key file -> harness DB -> interactive prompt
+    key = load_api_key()
+    if not key:
+        key = prompt_api_key()
+        if key:
+            save_api_key(key)
+        else:
+            print("warning: no API key available — monitor cannot authenticate.\n"
+                  "         Run: opencode-go-status --setup set-key  "
+                  "(or export OPENCODE_GO_API_KEY)")
+    elif not os.path.isfile(KEY_FILE):
+        save_api_key(key)  # persist so the PC no longer needs the harness DB
+
+    # 4. startup registration
+    method = register_startup()
+    print(f"startup registration: {method}")
+
+    # 5. verify / warn
+    if method == "systemd":
+        active, enabled, pid = service_state()
+        print(f"service: {UNIT_NAME} active={active} enabled={enabled}")
+        if active != "active":
+            sys.stderr.write(f"error: service did not start (state={active}); "
+                             f"check `journalctl --user -u {UNIT_NAME}`\n")
+            return 1
+        strays = stray_instances(pid)
+    else:
+        strays = stray_instances(None)
+    if strays:
+        print(f"warning: other instances running (pid={sorted(strays)}); "
+              "stop them to avoid double checks")
+    send_notification("ok", {"model": cp["status"].get("model", DEFAULT_MODEL),
+                             "http": 200, "latency_ms": None, "ttft_ms": None,
+                             "reply": "monitor started"})
+    print("setup complete")
+    return 0
+
+
+def cmd_uninstall(args):
+    method = unregister_startup()
+    if method:
+        print(f"startup registration removed: {method}")
+    else:
+        print("no startup registration found")
+    print(f"config and API key kept: {args.config}, {KEY_FILE}")
+    strays = stray_instances(None)
+    if strays:
+        print(f"warning: monitor still running (pid={sorted(strays)}); "
+              f"stop it with: kill {' '.join(map(str, sorted(strays)))}")
+    return 0
+
+
+def cmd_status(args):
+    cp = load_config(args.config)
+    print(f"config: {args.config}")
+    for k, v in cp["status"].items():
+        print(f"  {k} = {v}")
+    key = load_api_key()
+    print(f"API key: {'set (' + ('env' if os.environ.get('OPENCODE_GO_API_KEY') else
+                                  ('file' if os.path.isfile(KEY_FILE) else 'harness DB')) + ')' if key else 'NOT SET'}")
+    if systemd_available() and os.path.isfile(UNIT_PATH):
+        active, enabled, pid = service_state()
+        print(f"service: active={active} enabled={enabled} pid={pid}")
+    elif os.path.isfile(AUTOSTART_PATH):
+        print("service: autostart entry present "
+              f"({AUTOSTART_PATH})")
+    else:
+        print("service: not registered")
+    status, detail = last_status_summary(cp["status"].get("log", DEFAULT_LOG))
+    if status is None:
+        print("latest status: (no log yet)")
+    else:
+        print(f"latest status: {status} @ {detail.get('ts')}")
+        for k in ("http", "ttfb_ms", "ttft_ms", "latency_ms", "reply", "reason"):
+            if detail.get(k) is not None:
+                print(f"  {k} = {detail[k]}")
+    print(f"notify-send: {shutil.which('notify-send') or 'NOT FOUND'}")
+    return 0
+
+
+def last_status_summary(log):
+    try:
+        with open(log, encoding="utf-8") as fh:
+            last = None
+            for last in fh:
+                pass
+        if last:
+            data = json.loads(last)
+            return data.get("status"), data
+    except (OSError, ValueError):
+        pass
+    return None, None
+
+
+def cmd_test_notify(args):
+    cp = load_config(args.config)
+    status, detail = last_status_summary(cp["status"].get("log", DEFAULT_LOG))
+    if status is None:
+        detail = {"model": DEFAULT_MODEL, "http": None, "latency_ms": None,
+                  "ttft_ms": None, "reply": None,
+                  "reason": "no log entries yet (run the monitor first)"}
+        status = "error"
+    send_notification(status, detail)
+    print(f"test notification sent (replaces previous {APP} notification)")
+    return 0
+
+
+def cmd_set_key(args):
+    key = os.environ.get("OPENCODE_GO_API_KEY", "").strip()
+    if not key:
+        key = prompt_api_key()
+    if not key:
+        print("no key provided — run with OPENCODE_GO_API_KEY set or answer the prompt")
+        return 1
+    save_api_key(key)
+    return 0
+
+
+# --------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog=APP,
+        description="Per-minute health check for OpenCode Go + self-contained "
+                    "setup for any PC.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+               "  opencode-go-status                      # run monitor (every 60s)\n"
+               "  opencode-go-status --once               # single check, no loop\n"
+               "  opencode-go-status --notify-now         # single check + notify\n"
+               "  opencode-go-status --setup install      # install on this PC\n"
+               "  opencode-go-status --setup status       # show current state",
+    )
+    ap.add_argument("--setup", choices=["install", "uninstall", "status",
+                                        "test-notify", "set-key"],
+                    help="run the setup/installer instead of the monitor")
+    ap.add_argument("--once", action="store_true",
+                    help="run a single check and exit")
+    ap.add_argument("--notify-now", action="store_true",
+                    help="run a single check, always notify, then exit")
+    ap.add_argument("--interval", type=float, default=argparse.SUPPRESS, metavar="SEC",
+                    help=f"seconds between checks (default {BUILTIN['interval']:g})")
+    ap.add_argument("--timeout", type=float, default=argparse.SUPPRESS, metavar="SEC",
+                    help=f"per-request timeout (default {BUILTIN['timeout']:g})")
+    ap.add_argument("--log", default=argparse.SUPPRESS, metavar="PATH",
+                    help=f"JSONL log file (default {BUILTIN['log']})")
+    ap.add_argument("--endpoint", default=argparse.SUPPRESS, metavar="URL",
+                    help=f"chat completions endpoint (default {BUILTIN['endpoint']})")
+    ap.add_argument("--model", default=argparse.SUPPRESS, metavar="ID",
+                    help=f"model id (default {BUILTIN['model']})")
+    ap.add_argument("--notify", choices=["change", "always", "off"], default=argparse.SUPPRESS,
+                    help="notification mode: change (default) | always | off")
+    ap.add_argument("--config", default=CONFIG, metavar="PATH",
+                    help=f"config file (default {CONFIG})")
+    args = ap.parse_args()
+
+    if args.setup:
+        if args.once or args.notify_now:
+            ap.error("--once/--notify-now cannot be combined with --setup")
+        return {"install": cmd_install, "uninstall": cmd_uninstall,
+                "status": cmd_status, "test-notify": cmd_test_notify,
+                "set-key": cmd_set_key}[args.setup](args)
+
+    if args.notify_now and args.once:
+        ap.error("--notify-now and --once are mutually exclusive")
+
+    api_key = load_api_key()
+    if not api_key:
+        sys.stderr.write(
+            f"error: no OpenCode Go API key found. Set OPENCODE_GO_API_KEY, "
+            f"or run: {APP} --setup set-key\n")
+        raise SystemExit(2)
+
+    def _shutdown(_sig, _frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    cp = load_config(args.config)
+    cfg = dict(cp["status"]) if cp.has_section("status") else {}
+    opt = {}
+    for key, builtin in BUILTIN.items():
+        cli = getattr(args, key, None)
+        opt[key] = cli if cli is not None else cfg.get(key, builtin)
+    opt["interval"] = float(opt["interval"])
+    opt["timeout"] = float(opt["timeout"])
+    notify_mode = opt["notify"]
+    if notify_mode not in ("change", "always", "off"):
+        notify_mode = "change"
+    raise SystemExit(run_monitor(opt, notify_mode, api_key, args.once, args.notify_now))
+
+
+if __name__ == "__main__":
+    main()

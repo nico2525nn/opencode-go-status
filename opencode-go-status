@@ -8,9 +8,11 @@ registers a systemd user service, falls back to XDG autostart without systemd).
 Monitor mode (default):
   Sends a minimal *streaming* chat completion to the OpenCode Go endpoint every
   INTERVAL seconds and appends one JSONL status line to the log, recording
-  TTFB (first SSE byte), TTFT (first token), and total latency. Sends desktop
-  notifications (notify-send) on status changes; each notification REPLACES the
-  previous one, so only the latest stays visible.
+  TTFB (first SSE byte), TTFT (first token), and total latency. Every
+  TPS_INTERVAL seconds (default 1h) a fixed-length generation probe measures
+  TPS (tokens per second). Sends desktop notifications (notify-send) on status
+  changes; each notification REPLACES the previous one, so only the latest
+  stays visible.
 
 Setup mode:
   opencode-go-status --setup install [--notify MODE] [--interval SEC] [...]
@@ -62,7 +64,9 @@ BIN = os.path.expanduser(f"~/.local/bin/{APP}")
 UNIT_NAME = f"{APP}.service"
 UNIT_PATH = os.path.expanduser(f"~/.config/systemd/user/{UNIT_NAME}")
 AUTOSTART_PATH = os.path.expanduser(f"~/.config/autostart/{APP}.desktop")
-PROMPT = "Reply with exactly: pong"
+PING_PROMPT = "Reply with exactly: pong"
+TPS_PROMPT = ("Reply with exactly: pong pong pong pong pong pong pong pong pong "
+              "pong pong pong pong pong pong pong pong pong pong pong")
 KEY_DB = os.path.expanduser("~/.omp/agent/agent.db")
 
 BUILTIN = {
@@ -72,6 +76,7 @@ BUILTIN = {
     "endpoint": DEFAULT_ENDPOINT,
     "model": DEFAULT_MODEL,
     "notify": "change",
+    "tps_interval": 3600.0,
 }
 
 UNIT_TEMPLATE = """\
@@ -164,15 +169,19 @@ def parse_endpoint(endpoint):
     return scheme, host, path
 
 
-def check(endpoint, model, api_key, timeout):
-    """One streaming probe. Returns (status, detail_dict)."""
+def check(endpoint, model, api_key, timeout, tps_probe=False):
+    """One streaming probe. Returns (status, detail_dict).
+
+    tps_probe=True generates a fixed-length reply so TPS (tokens per second)
+    is measurable; the regular probe stays a minimal 2-token ping.
+    """
     scheme, host, path = parse_endpoint(endpoint)
     conn_cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
     conn = conn_cls(host, timeout=timeout)
     body = json.dumps({
         "model": model,
-        "messages": [{"role": "user", "content": PROMPT}],
-        "max_tokens": 8,
+        "messages": [{"role": "user", "content": TPS_PROMPT if tps_probe else PING_PROMPT}],
+        "max_tokens": 64 if tps_probe else 8,
         "temperature": 0,
         "thinking": {"type": "disabled"},
         "stream": True,
@@ -180,10 +189,11 @@ def check(endpoint, model, api_key, timeout):
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "User-Agent": f"{APP}/3.0",
+        "User-Agent": f"{APP}/3.1",
     }
     detail = {"http": None, "ttfb_ms": None, "ttft_ms": None,
-              "latency_ms": None, "reason": None}
+              "latency_ms": None, "reason": None, "tps": None,
+              "probe": "tps" if tps_probe else "ping"}
     t0 = time.monotonic()
     reply_parts = []
     usage = {}
@@ -248,6 +258,14 @@ def check(endpoint, model, api_key, timeout):
             "total": usage.get("total_tokens"),
         },
     })
+    if tps_probe:
+        stream_ms = None
+        if (detail["latency_ms"] is not None and detail["ttft_ms"] is not None
+                and detail["latency_ms"] >= detail["ttft_ms"]):
+            stream_ms = detail["latency_ms"] - detail["ttft_ms"]
+        completion = usage.get("completion_tokens")
+        if stream_ms and stream_ms > 0 and completion:
+            detail["tps"] = round(completion / (stream_ms / 1000), 1)
     return "ok", detail
 
 
@@ -295,8 +313,9 @@ def send_notification(status, detail):
         urgency, title = "normal", f"{APP}: OK ({model})"
         lat_s = f"latency={lat / 1000:.1f}s · " if lat is not None else ""
         ttft_s = f"ttft={ttft / 1000:.1f}s · " if ttft is not None else ""
+        tps_s = f" · tps={detail.get('tps')}" if detail.get("tps") is not None else ""
         body = (lat_s + ttft_s +
-                f'http={detail.get("http")} · reply="{detail.get("reply")}"')
+                f'http={detail.get("http")} · reply="{detail.get("reply")}"' + tps_s)
     else:
         urgency, title = "critical", f"{APP}: DOWN ({model})"
         body = f'reason={detail.get("reason")} · http={detail.get("http")}'
@@ -346,13 +365,20 @@ def run_monitor(opt, notify_mode, api_key, once, notify_now):
     os.makedirs(log_dir, exist_ok=True)
     sys.stdout.write(
         f"{APP}: model={opt['model']} endpoint={opt['endpoint']} "
-        f"interval={opt['interval']:g}s notify={notify_mode} log={opt['log']}\n"
+        f"interval={opt['interval']:g}s notify={notify_mode} "
+        f"tps_interval={opt['tps_interval']:g}s log={opt['log']}\n"
     )
     sys.stdout.flush()
 
     prev_status = read_last_status(opt["log"])
+    last_tps = float("-inf")  # first check is a TPS probe
     while True:
-        status, detail = check(opt["endpoint"], opt["model"], api_key, opt["timeout"])
+        tps_probe = (opt["tps_interval"] > 0
+                     and time.monotonic() - last_tps >= opt["tps_interval"])
+        status, detail = check(opt["endpoint"], opt["model"], api_key,
+                               opt["timeout"], tps_probe=tps_probe)
+        if tps_probe:
+            last_tps = time.monotonic()
         line = {"ts": now_iso(), "status": status, **detail}
         with open(opt["log"], "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line, ensure_ascii=False) + "\n")
@@ -362,9 +388,13 @@ def run_monitor(opt, notify_mode, api_key, once, notify_now):
             send_notification(status, detail)
 
         parts = [line["ts"], status]
+        if detail.get("probe") == "tps":
+            parts.append("probe=tps")
         for k in ("http", "latency_ms", "ttft_ms", "ttfb_ms"):
             if detail.get(k) is not None:
                 parts.append(f"{k}={detail[k]}ms" if k.endswith("_ms") else f"{k}={detail[k]}")
+        if detail.get("tps") is not None:
+            parts.append(f'tps={detail["tps"]}')
         if detail.get("reply"):
             parts.append(f'reply="{detail["reply"]}"')
         if detail.get("reason"):
@@ -455,7 +485,8 @@ def cmd_install(args):
 
     # 2. persist config
     cp = load_config(args.config)
-    for key in ("interval", "timeout", "log", "endpoint", "model", "notify"):
+    for key in ("interval", "timeout", "log", "endpoint", "model", "notify",
+                "tps_interval"):
         val = getattr(args, key, None)
         if val is not None:
             cp["status"][key] = str(val)
@@ -616,6 +647,9 @@ def main():
                     help=f"model id (default {BUILTIN['model']})")
     ap.add_argument("--notify", choices=["change", "always", "off"], default=argparse.SUPPRESS,
                     help="notification mode: change (default) | always | off")
+    ap.add_argument("--tps-interval", type=float, default=argparse.SUPPRESS, metavar="SEC",
+                    help=f"seconds between TPS probes, 0=off "
+                         f"(default {BUILTIN['tps_interval']:g})")
     ap.add_argument("--config", default=CONFIG, metavar="PATH",
                     help=f"config file (default {CONFIG})")
     args = ap.parse_args()
@@ -651,6 +685,7 @@ def main():
         opt[key] = cli if cli is not None else cfg.get(key, builtin)
     opt["interval"] = float(opt["interval"])
     opt["timeout"] = float(opt["timeout"])
+    opt["tps_interval"] = float(opt["tps_interval"])
     notify_mode = opt["notify"]
     if notify_mode not in ("change", "always", "off"):
         notify_mode = "change"

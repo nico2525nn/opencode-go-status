@@ -287,6 +287,23 @@ def read_last_status(log_path):
     return None
 
 
+def read_last_tps(log_path):
+    """Latest measured TPS from the JSONL log, or None."""
+    try:
+        with open(log_path, encoding="utf-8") as fh:
+            last = None
+            for line in fh:
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    continue
+                if data.get("tps") is not None:
+                    last = data["tps"]
+        return last
+    except OSError:
+        return None
+
+
 # ------------------------------------------------------------- notifications
 
 _plain_fallback = [False]
@@ -300,8 +317,12 @@ def read_notify_id():
         return None
 
 
-def send_notification(status, detail):
-    """Desktop notification that REPLACES the previous one (latest stays)."""
+def send_notification(status, detail, log_path=None):
+    """Desktop notification that REPLACES the previous one (latest stays).
+
+    OK notifications always show the latest measured TPS (from the log when
+    the triggering check was not itself a TPS probe).
+    """
     notify = shutil.which("notify-send")
     if not notify:
         sys.stderr.write("warning: notify-send not found; notification skipped\n")
@@ -313,7 +334,10 @@ def send_notification(status, detail):
         urgency, title = "normal", f"{APP}: OK ({model})"
         lat_s = f"latency={lat / 1000:.1f}s · " if lat is not None else ""
         ttft_s = f"ttft={ttft / 1000:.1f}s · " if ttft is not None else ""
-        tps_s = f" · tps={detail.get('tps')}" if detail.get("tps") is not None else ""
+        tps = detail.get("tps")
+        if tps is None and log_path:
+            tps = read_last_tps(log_path)
+        tps_s = f" · tps={tps}" if tps is not None else ""
         body = (lat_s + ttft_s +
                 f'http={detail.get("http")} · reply="{detail.get("reply")}"' + tps_s)
     else:
@@ -385,7 +409,7 @@ def run_monitor(opt, notify_mode, api_key, once, notify_now):
 
         changed = prev_status is None or prev_status != status
         if notify_now or notify_mode == "always" or (notify_mode == "change" and changed):
-            send_notification(status, detail)
+            send_notification(status, detail, opt["log"])
 
         parts = [line["ts"], status]
         if detail.get("probe") == "tps":
@@ -528,7 +552,8 @@ def cmd_install(args):
               "stop them to avoid double checks")
     send_notification("ok", {"model": cp["status"].get("model", DEFAULT_MODEL),
                              "http": 200, "latency_ms": None, "ttft_ms": None,
-                             "reply": "monitor started"})
+                             "reply": "monitor started"},
+                      cp["status"].get("log", DEFAULT_LOG))
     print("setup complete")
     return 0
 
@@ -591,13 +616,14 @@ def last_status_summary(log):
 
 def cmd_test_notify(args):
     cp = load_config(args.config)
-    status, detail = last_status_summary(cp["status"].get("log", DEFAULT_LOG))
+    log = cp["status"].get("log", DEFAULT_LOG)
+    status, detail = last_status_summary(log)
     if status is None:
         detail = {"model": DEFAULT_MODEL, "http": None, "latency_ms": None,
                   "ttft_ms": None, "reply": None,
                   "reason": "no log entries yet (run the monitor first)"}
         status = "error"
-    send_notification(status, detail)
+    send_notification(status, detail, log)
     print(f"test notification sent (replaces previous {APP} notification)")
     return 0
 

@@ -44,6 +44,7 @@ cp opencode-go-status ~/.local/bin/
 | `opencode-go-status` | モニタ実行(毎分チェック) |
 | `opencode-go-status --once` | 1回だけチェックして終了 |
 | `opencode-go-status --notify-now` | 1回チェックして必ず通知 |
+| `opencode-go-status --bench --model <モデル>` | 任意のモデルで1回だけTPS/TTFTを計測 |
 | `opencode-go-status --setup install [設定...]` | 設定保存 + サービス再登録 |
 | `opencode-go-status --setup uninstall` | サービス登録を解除(設定・キーは保持) |
 | `opencode-go-status --setup status` | 設定・サービス状態・最新ステータス表示 |
@@ -89,6 +90,36 @@ systemctl --user restart opencode-go-status.service
 - `status`: `ok` / `error`(エラー時は `reason` に理由)
 - `ttfb_ms`: 最初のSSEバイトまで / `ttft_ms`: 最初のトークンまで / `latency_ms`: ストリーム完了まで
 - `probe`: `ping`(毎分) / `tps`(TPS計測時)。`tps` は tokens/秒
+
+## ベンチマーク
+
+任意のモデルで **1回だけ** TPS / TTFT を計測します(モニタのログには書かれません):
+
+```bash
+opencode-go-status --bench --model deepseek-v4-pro
+opencode-go-status --bench --model grok-4.5 --json           # 機械可読出力
+opencode-go-status --bench --model opencode-go/kimi-k3       # プレフィックスは自動除去
+opencode-go-status --bench --model deepseek-v4-flash --endpoint https://…  # 任意のOpenAI互換API
+```
+
+出力例:
+
+```
+model:    deepseek-v4-flash
+endpoint: https://opencode.ai/zen/go/v1/chat/completions
+status:   ok  (http 200)
+ttfb:     1.22s
+ttft:     8.62s  (first content token)
+          first token: 1.22s (incl. reasoning)
+latency:  10.44s
+tokens:   93 prompt + 959 completion = 1052 total
+tps:      104.0 tokens/s (959 tokens / 9.22s stream)
+```
+
+- 固定長プロンプトのストリーミング生成で計測。デフォルト最大1024トークン(`--max-tokens` で変更)
+- `ttft` = 最初の**表示コンテンツ**トークンまで。reasoningが先行するモデルでは最初のトークン(推理込み)も併記
+- `tps` = completionトークン数 ÷ ストリーム時間(最初のトークン〜完了)。reasoningトークンも含む実スループット
+- thinkingパラメータは送信しません(Goエンドポイントは `thinking: disabled` を誤処理し、contentを返さなくなるため)
 
 ## 通知
 

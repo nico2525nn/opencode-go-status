@@ -67,6 +67,7 @@ AUTOSTART_PATH = os.path.expanduser(f"~/.config/autostart/{APP}.desktop")
 PING_PROMPT = "Reply with exactly: pong"
 TPS_PROMPT = ("Reply with exactly: pong pong pong pong pong pong pong pong pong "
               "pong pong pong pong pong pong pong pong pong pong pong")
+BENCH_PROMPT = "Repeat the word pong exactly 50 times."
 KEY_DB = os.path.expanduser("~/.omp/agent/agent.db")
 
 BUILTIN = {
@@ -169,35 +170,41 @@ def parse_endpoint(endpoint):
     return scheme, host, path
 
 
-def check(endpoint, model, api_key, timeout, tps_probe=False):
-    """One streaming probe. Returns (status, detail_dict).
+def stream_probe(endpoint, model, api_key, timeout, content, max_tokens,
+                 compute_tps=False, track_content_ttft=False):
+    """One streaming chat completion. Returns (status, detail_dict).
 
-    tps_probe=True generates a fixed-length reply so TPS (tokens per second)
-    is measurable; the regular probe stays a minimal 2-token ping.
+    detail keys: http, ttfb_ms, ttft_ms (first non-empty delta), latency_ms,
+    reason, tps (when compute_tps), ttft_content_ms (when track_content_ttft),
+    model, reply, usage. Errors carry reason/http; ok carries reply/usage.
+
+    No thinking parameter is sent: the Go endpoint currently mishandles
+    `thinking: disabled` (produces reasoning but never emits content), while
+    reasoning models behave normally without it. Reasoning tokens count
+    toward completion_tokens / TPS.
     """
     scheme, host, path = parse_endpoint(endpoint)
     conn_cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
     conn = conn_cls(host, timeout=timeout)
     body = json.dumps({
         "model": model,
-        "messages": [{"role": "user", "content": TPS_PROMPT if tps_probe else PING_PROMPT}],
-        "max_tokens": 64 if tps_probe else 8,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": max_tokens,
         "temperature": 0,
-        "thinking": {"type": "disabled"},
         "stream": True,
     })
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "User-Agent": f"{APP}/3.1",
+        "User-Agent": f"{APP}/3.2",
     }
     detail = {"http": None, "ttfb_ms": None, "ttft_ms": None,
-              "latency_ms": None, "reason": None, "tps": None,
-              "probe": "tps" if tps_probe else "ping"}
+              "latency_ms": None, "reason": None, "tps": None}
     t0 = time.monotonic()
     reply_parts = []
     usage = {}
     finished = False
+    first_content_ms = None
     try:
         conn.request("POST", path, body=body, headers=headers)
         resp = conn.getresponse()
@@ -221,6 +228,8 @@ def check(endpoint, model, api_key, timeout, tps_probe=False):
                 chunk = json.loads(payload)
             except ValueError:
                 continue
+            if chunk.get("usage"):
+                usage = chunk["usage"]
             choices = chunk.get("choices") or []
             if not choices:
                 continue
@@ -229,6 +238,9 @@ def check(endpoint, model, api_key, timeout, tps_probe=False):
             if token:
                 if detail["ttft_ms"] is None:
                     detail["ttft_ms"] = round((time.monotonic() - t0) * 1000)
+                if (track_content_ttft and delta.get("content")
+                        and first_content_ms is None):
+                    first_content_ms = round((time.monotonic() - t0) * 1000)
                 reply_parts.append(token)
             if choices[0].get("finish_reason"):
                 finished = True
@@ -258,7 +270,9 @@ def check(endpoint, model, api_key, timeout, tps_probe=False):
             "total": usage.get("total_tokens"),
         },
     })
-    if tps_probe:
+    if track_content_ttft:
+        detail["ttft_content_ms"] = first_content_ms
+    if compute_tps:
         stream_ms = None
         if (detail["latency_ms"] is not None and detail["ttft_ms"] is not None
                 and detail["latency_ms"] >= detail["ttft_ms"]):
@@ -267,6 +281,16 @@ def check(endpoint, model, api_key, timeout, tps_probe=False):
         if stream_ms and stream_ms > 0 and completion:
             detail["tps"] = round(completion / (stream_ms / 1000), 1)
     return "ok", detail
+
+
+def check(endpoint, model, api_key, timeout, tps_probe=False):
+    """Monitor probe: minimal 2-token ping, or fixed-length TPS generation."""
+    content = TPS_PROMPT if tps_probe else PING_PROMPT
+    max_tokens = 64 if tps_probe else 8
+    status, detail = stream_probe(endpoint, model, api_key, timeout, content,
+                                  max_tokens, compute_tps=tps_probe)
+    detail["probe"] = "tps" if tps_probe else "ping"
+    return status, detail
 
 
 def now_iso():
@@ -639,6 +663,85 @@ def cmd_set_key(args):
     return 0
 
 
+# --------------------------------------------------------------------- bench
+
+def bare_model(model):
+    """Strip provider prefix (opencode-go/, opencode-zen/) for API use."""
+    for prefix in ("opencode-go/", "opencode-zen/"):
+        if model.startswith(prefix):
+            return model[len(prefix):]
+    return model
+
+
+def fmt_ms(ms):
+    return "—" if ms is None else f"{ms / 1000:.2f}s"
+
+
+def cmd_bench(args):
+    """One-shot TPS/TTFT benchmark for an arbitrary model."""
+    api_key = load_api_key()
+    if not api_key:
+        sys.stderr.write(
+            f"error: no OpenCode Go API key found. Set OPENCODE_GO_API_KEY, "
+            f"or run: {APP} --setup set-key\n")
+        return 2
+    request_model = bare_model(args.model)
+    status, detail = stream_probe(args.endpoint, request_model, api_key,
+                                  args.timeout, BENCH_PROMPT, args.max_tokens,
+                                  compute_tps=True, track_content_ttft=True)
+    if args.json:
+        out = {
+            "ts": now_iso(),
+            "status": status,
+            "model": args.model,
+            "endpoint": args.endpoint,
+            "http": detail.get("http"),
+            "ttfb_ms": detail.get("ttfb_ms"),
+            "ttft_ms": detail.get("ttft_ms"),
+            "ttft_content_ms": detail.get("ttft_content_ms"),
+            "latency_ms": detail.get("latency_ms"),
+            "tps": detail.get("tps"),
+            "tokens": detail.get("usage"),
+            "reason": detail.get("reason"),
+        }
+        print(json.dumps(out, ensure_ascii=False))
+        return 0 if status == "ok" else 1
+
+    print(f"model:    {args.model}" +
+          (f"  ({request_model})" if request_model != args.model else ""))
+    print(f"endpoint: {args.endpoint}")
+    print(f"status:   {status}  (http {detail.get('http')})")
+    print(f"ttfb:     {fmt_ms(detail.get('ttfb_ms'))}")
+    ttft_content = detail.get("ttft_content_ms")
+    if ttft_content is not None:
+        print(f"ttft:     {fmt_ms(ttft_content)}  (first content token)")
+        if (detail.get("ttft_ms") is not None
+                and detail["ttft_ms"] != ttft_content):
+            print(f"          first token: {fmt_ms(detail.get('ttft_ms'))} (incl. reasoning)")
+    else:
+        print(f"ttft:     {fmt_ms(detail.get('ttft_ms'))}  (first token; "
+              "no content within max_tokens — budget spent on reasoning)")
+    print(f"latency:  {fmt_ms(detail.get('latency_ms'))}")
+    usage = detail.get("usage") or {}
+    if usage.get("total") is not None:
+        print(f"tokens:   {usage.get('prompt')} prompt + {usage.get('completion')} "
+              f"completion = {usage.get('total')} total")
+    if detail.get("tps") is not None:
+        print(f"tps:      {detail['tps']} tokens/s "
+              f"({detail['usage']['completion']} tokens / "
+              f"{(detail['latency_ms'] - detail['ttft_ms']) / 1000:.2f}s stream)")
+    else:
+        print("tps:      — (usage not reported by the endpoint)")
+    if detail.get("reply"):
+        reply = detail["reply"]
+        if len(reply) > 60:
+            reply = reply[:60] + "…"
+        print(f'reply:    "{reply}"')
+    if detail.get("reason"):
+        print(f"reason:   {detail['reason']}")
+    return 0 if status == "ok" else 1
+
+
 # --------------------------------------------------------------------- main
 
 def main():
@@ -678,7 +781,26 @@ def main():
                          f"(default {BUILTIN['tps_interval']:g})")
     ap.add_argument("--config", default=CONFIG, metavar="PATH",
                     help=f"config file (default {CONFIG})")
+    ap.add_argument("--bench", action="store_true",
+                    help="one-shot TPS/TTFT benchmark (requires --model)")
+    ap.add_argument("--max-tokens", type=int, default=1024, metavar="N",
+                    help="bench: max generation tokens (default 1024; "
+                         "reasoning models need budget for content)")
+    ap.add_argument("--json", action="store_true",
+                    help="bench: emit JSON result instead of a report")
     args = ap.parse_args()
+
+    if args.setup and args.bench:
+        ap.error("--setup and --bench are mutually exclusive")
+    if args.bench:
+        if args.once or args.notify_now:
+            ap.error("--once/--notify-now cannot be combined with --bench")
+        model = getattr(args, "model", None)
+        if not model:
+            ap.error("--bench requires --model (e.g. deepseek-v4-flash, grok-4.5)")
+        args.timeout = float(getattr(args, "timeout", None) or BUILTIN["timeout"])
+        args.endpoint = getattr(args, "endpoint", None) or BUILTIN["endpoint"]
+        return cmd_bench(args)
 
     if args.setup:
         if args.once or args.notify_now:
@@ -719,4 +841,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

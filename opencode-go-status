@@ -27,8 +27,11 @@ Setup mode:
       (re)set the OpenCode Go API key
 
 Config file (INI): ~/.config/opencode-go-status/config
+  [status] keys: interval, timeout, log, provider (go|zen), endpoint
+  (overrides provider), model, notify, tps_interval
 API key:           ~/.config/opencode-go-status/key  (mode 600, or
-                   $OPENCODE_GO_API_KEY, or the omp harness agent.db)
+                   $OPENCODE_GO_API_KEY, or the omp harness agent.db;
+                   opencode-go and opencode-zen share the same key)
 Service unit:      ~/.config/systemd/user/opencode-go-status.service
                    (fallback: ~/.config/autostart/opencode-go-status.desktop)
 
@@ -54,6 +57,10 @@ from datetime import datetime, timezone
 APP = "opencode-go-status"
 DEFAULT_ENDPOINT = "https://opencode.ai/zen/go/v1/chat/completions"
 DEFAULT_MODEL = "deepseek-v4-flash"
+PROVIDERS = {
+    "go": "https://opencode.ai/zen/go/v1/chat/completions",
+    "zen": "https://opencode.ai/zen/v1/chat/completions",
+}
 DEFAULT_LOG = os.path.expanduser("~/opencode-go-status.log")
 CONFIG_DIR = os.path.expanduser("~/.config/opencode-go-status")
 CONFIG = os.path.join(CONFIG_DIR, "config")
@@ -75,6 +82,7 @@ BUILTIN = {
     "timeout": 30.0,
     "log": DEFAULT_LOG,
     "endpoint": DEFAULT_ENDPOINT,
+    "provider": "go",
     "model": DEFAULT_MODEL,
     "notify": "change",
     "tps_interval": 3600.0,
@@ -122,14 +130,14 @@ def load_api_key():
         pass
     try:
         con = sqlite3.connect(f"file:{KEY_DB}?mode=ro", uri=True)
-        row = con.execute(
-            "SELECT data FROM auth_credentials WHERE provider='opencode-go'"
-        ).fetchone()
-        con.close()
-        if row:
-            key = json.loads(row[0]).get("key")
-            if key:
-                return key
+        for prov in ("opencode-go", "opencode-zen"):
+            row = con.execute(
+                "SELECT data FROM auth_credentials WHERE provider=?", (prov,)
+            ).fetchone()
+            if row:
+                key = json.loads(row[0]).get("key")
+                if key:
+                    return key
     except Exception:  # noqa: BLE001 — harness DB may not exist on other PCs
         pass
     return None
@@ -534,7 +542,7 @@ def cmd_install(args):
     # 2. persist config
     cp = load_config(args.config)
     for key in ("interval", "timeout", "log", "endpoint", "model", "notify",
-                "tps_interval"):
+                "tps_interval", "provider"):
         val = getattr(args, key, None)
         if val is not None:
             cp["status"][key] = str(val)
@@ -771,7 +779,10 @@ def main():
     ap.add_argument("--log", default=argparse.SUPPRESS, metavar="PATH",
                     help=f"JSONL log file (default {BUILTIN['log']})")
     ap.add_argument("--endpoint", default=argparse.SUPPRESS, metavar="URL",
-                    help=f"chat completions endpoint (default {BUILTIN['endpoint']})")
+                    help=f"chat completions endpoint; overrides provider "
+                         f"(default {BUILTIN['endpoint']})")
+    ap.add_argument("--provider", choices=list(PROVIDERS), default=argparse.SUPPRESS,
+                    help="provider preset: go (default) | zen")
     ap.add_argument("--model", default=argparse.SUPPRESS, metavar="ID",
                     help=f"model id (default {BUILTIN['model']})")
     ap.add_argument("--notify", choices=["change", "always", "off"], default=argparse.SUPPRESS,
@@ -799,7 +810,11 @@ def main():
         if not model:
             ap.error("--bench requires --model (e.g. deepseek-v4-flash, grok-4.5)")
         args.timeout = float(getattr(args, "timeout", None) or BUILTIN["timeout"])
-        args.endpoint = getattr(args, "endpoint", None) or BUILTIN["endpoint"]
+        provider = getattr(args, "provider", None) or "go"
+        if provider not in PROVIDERS:
+            provider = "go"
+        args.endpoint = (getattr(args, "endpoint", None)
+                         or PROVIDERS[provider])
         return cmd_bench(args)
 
     if args.setup:
@@ -834,6 +849,9 @@ def main():
     opt["interval"] = float(opt["interval"])
     opt["timeout"] = float(opt["timeout"])
     opt["tps_interval"] = float(opt["tps_interval"])
+    opt["provider"] = opt["provider"] if opt["provider"] in PROVIDERS else "go"
+    if getattr(args, "endpoint", None) is None and not cfg.get("endpoint"):
+        opt["endpoint"] = PROVIDERS[opt["provider"]]
     notify_mode = opt["notify"]
     if notify_mode not in ("change", "always", "off"):
         notify_mode = "change"

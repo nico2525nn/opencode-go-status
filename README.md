@@ -64,7 +64,8 @@ cp opencode-go-status ~/.local/bin/
 | `notify` | `change` | `change`(状態変化時)/ `always`(毎分)/ `off`(無効) |
 | `tps_interval` | `3600` | TPS計測間隔(秒)。`0` で無効 |
 | `log` | `~/opencode-go-status.log` | JSONLログのパス |
-| `endpoint` | `https://opencode.ai/zen/go/v1/chat/completions` | APIエンドポイント |
+| `provider` | `go` | プロバイダプリセット: `go`(定額サブスク)/ `zen`(Zen残高・従量) |
+| `endpoint` | (provider別) | APIエンドポイント(指定するとproviderを上書き) |
 | `model` | `deepseek-v4-flash` | モデルID |
 
 設定変更の例:
@@ -99,8 +100,13 @@ systemctl --user restart opencode-go-status.service
 opencode-go-status --bench --model deepseek-v4-pro
 opencode-go-status --bench --model grok-4.5 --json           # 機械可読出力
 opencode-go-status --bench --model opencode-go/kimi-k3       # プレフィックスは自動除去
-opencode-go-status --bench --model deepseek-v4-flash --endpoint https://…  # 任意のOpenAI互換API
+opencode-go-status --bench --model deepseek-v4-flash --provider zen   # Zen(従量)経由
+opencode-go-status --bench --model X --endpoint https://…  # 任意のOpenAI互換API
 ```
+
+APIキーは `go` と `zen` で共通です。Zenの残高が無いと `CreditsError: Insufficient balance`
+が返ります(残高は https://opencode.ai/zen で確認)。モニタをZen経由にする場合は
+`opencode-go-status --setup install --provider zen` の後、サービスを再起動してください。
 
 出力例:
 

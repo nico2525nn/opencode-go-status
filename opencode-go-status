@@ -86,6 +86,7 @@ BUILTIN = {
     "model": DEFAULT_MODEL,
     "notify": "change",
     "tps_interval": 3600.0,
+    "log_max_mb": 5.0,
 }
 
 UNIT_TEMPLATE = """\
@@ -337,6 +338,24 @@ def read_last_tps(log_path):
         return None
 
 
+def rotate_log(path, max_mb, keep=2):
+    """Rename path -> .1 -> .2 when larger than max_mb (call before appending)."""
+    try:
+        if os.path.getsize(path) < max_mb * 1024 * 1024:
+            return
+    except OSError:
+        return
+    for i in range(keep - 1, 0, -1):
+        src, dst = f"{path}.{i}", f"{path}.{i + 1}"
+        if os.path.exists(src):
+            if os.path.exists(dst):
+                os.remove(dst)
+            os.rename(src, dst)
+    if os.path.exists(f"{path}.1"):
+        os.remove(f"{path}.1")
+    os.rename(path, f"{path}.1")
+
+
 # ------------------------------------------------------------- notifications
 
 _plain_fallback = [False]
@@ -437,6 +456,9 @@ def run_monitor(opt, notify_mode, api_key, once, notify_now):
         if tps_probe:
             last_tps = time.monotonic()
         line = {"ts": now_iso(), "status": status, **detail}
+        if line.get("reply") and len(line["reply"]) > 100:
+            line["reply"] = line["reply"][:100] + "…"
+        rotate_log(opt["log"], opt["log_max_mb"])
         with open(opt["log"], "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line, ensure_ascii=False) + "\n")
 
@@ -543,7 +565,7 @@ def cmd_install(args):
     # 2. persist config
     cp = load_config(args.config)
     for key in ("interval", "timeout", "log", "endpoint", "model", "notify",
-                "tps_interval", "provider"):
+                "tps_interval", "provider", "log_max_mb"):
         val = getattr(args, key, None)
         if val is not None:
             cp["status"][key] = str(val)
@@ -791,6 +813,9 @@ def main():
     ap.add_argument("--tps-interval", type=float, default=argparse.SUPPRESS, metavar="SEC",
                     help=f"seconds between TPS probes, 0=off "
                          f"(default {BUILTIN['tps_interval']:g})")
+    ap.add_argument("--log-max-mb", type=float, default=argparse.SUPPRESS, metavar="MB",
+                    help=f"rotate JSONL log above this size, keeping 2 backups "
+                         f"(default {BUILTIN['log_max_mb']:g})")
     ap.add_argument("--config", default=CONFIG, metavar="PATH",
                     help=f"config file (default {CONFIG})")
     ap.add_argument("--bench", action="store_true",
@@ -850,6 +875,7 @@ def main():
     opt["interval"] = float(opt["interval"])
     opt["timeout"] = float(opt["timeout"])
     opt["tps_interval"] = float(opt["tps_interval"])
+    opt["log_max_mb"] = float(opt["log_max_mb"])
     opt["provider"] = opt["provider"] if opt["provider"] in PROVIDERS else "go"
     if getattr(args, "endpoint", None) is None and not cfg.get("endpoint"):
         opt["endpoint"] = PROVIDERS[opt["provider"]]

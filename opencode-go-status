@@ -242,7 +242,8 @@ def stream_probe(endpoint, model, api_key, timeout, content, max_tokens,
             if not choices:
                 continue
             delta = choices[0].get("delta") or {}
-            token = delta.get("content") or delta.get("reasoning_content")
+            token = (delta.get("content") or delta.get("reasoning_content")
+                     or delta.get("reasoning"))
             if token:
                 if detail["ttft_ms"] is None:
                     detail["ttft_ms"] = round((time.monotonic() - t0) * 1000)

@@ -287,7 +287,8 @@ def stream_probe(endpoint, model, api_key, timeout, content, max_tokens,
         if (detail["latency_ms"] is not None and detail["ttft_ms"] is not None
                 and detail["latency_ms"] >= detail["ttft_ms"]):
             stream_ms = detail["latency_ms"] - detail["ttft_ms"]
-        completion = usage.get("completion_tokens")
+        if stream_ms and stream_ms >= 50 and completion:
+            detail["tps"] = round(completion / (stream_ms / 1000), 1)
         if stream_ms and stream_ms > 0 and completion:
             detail["tps"] = round(completion / (stream_ms / 1000), 1)
     return "ok", detail

@@ -1,8 +1,10 @@
-# opencode-go-status
+このリポジトリには3つのツールが入っています:
 
-OpenCode Go (`opencode-go/deepseek-v4-flash`) の応答を**毎分**ヘルスチェックし、応答性能
-(TTFB / TTFT / latency) と **1時間ごとの TPS** をログに記録、状態変化をデスクトップ通知する
-モニタツール。1ファイル自己完結で、`--setup install` だけでどのPCにも導入できます。
+| ファイル | 説明 |
+|---|---|
+| `opencode-go-status` | モニタ + セットアップ + 単発ベンチ |
+| `go-usage` | OpenCode Go サブスク残量を**複数ワークスペース一括**で表示 |
+| `ox-alpha-bench`(※) | ox-alpha の3プロバイダTPS/TTFTベンチ(※個人用のためリポジトリ外) |
 
 ## 特徴
 
@@ -143,15 +145,24 @@ tps:      104.0 tokens/s (959 tokens / 9.22s stream)
 
 (DeepSeek V4 Flash: input $0.14 / output $0.28 per 1M tokens で計算)
 
-## 開発
+## go-usage — サブスク残量の一括表示
 
-リポジトリが正(canonical)、配備先はコピー管理です:
+OpenCode Go の利用枠(5時間 / 週次 / 月次)を**複数ワークスペース分まとめて**表示します。
+サブスクを複数(メイン+サブワークスペース等)持っている場合に各アカウントのキーを登録して
+一括確認できます。
 
 ```bash
-# 編集 → コミット後、配備
-cp opencode-go-status ~/.local/bin/
-systemctl --user restart opencode-go-status.service
+go-usage                  # 一覧表示(使用率高は色分け: 緑<60% / 黄60-89% / 赤>=90%)
+go-usage --add main       # キーを対話入力で登録(ラベル付き、ファイルは mode 600)
+go-usage --add sub        # 2枠目以降も同じ
+go-usage --remove sub     # 削除
+go-usage --json           # 機械可読出力
 ```
+
+キーは `~/.config/go-usage/config` の `[keys]` セクションに保存されます
+(API: `GET https://opencode.ai/zen/go/v1/usage`、`percent` と `resetsAt` を返します)。
+
+## ライセンス
 
 ## ライセンス
 

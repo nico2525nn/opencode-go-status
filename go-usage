@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""go-usage — OpenCode Go subscription usage for multiple workspaces.
+
+Queries https://opencode.ai/zen/go/v1/usage for each stored API key and
+prints the three limits (5-hour rolling / weekly / monthly) side by side.
+Percentages are colorized (green <60%, yellow 60-89%, red >=90%).
+
+Keys are stored per account label in the config file (mode 600):
+  ~/.config/go-usage/config
+    [keys]
+    main = sk-…
+    sub  = sk-…
+
+Usage:
+  go-usage                 # show the table for all stored keys
+  go-usage --add LABEL     # prompt for a new key (getpass, no echo)
+  go-usage --remove LABEL  # delete a stored key
+  go-usage --json          # machine-readable output (no colors)
+
+Exit codes:
+  0  all accounts queried ok
+  1  at least one account failed
+  2  startup error (no keys, bad args)
+"""
+import argparse
+import configparser
+import getpass
+import http.client
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+APP = "go-usage"
+CONFIG = os.path.expanduser("~/.config/go-usage/config")
+USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
+TIMEOUT = 15
+
+LIMIT_ORDER = ["rolling", "weekly", "monthly"]
+LIMIT_LABELS = {"rolling": "5h", "weekly": "week", "monthly": "month"}
+
+
+def load_config(path):
+    cp = configparser.ConfigParser()
+    if os.path.isfile(path):
+        cp.read(path, encoding="utf-8")
+    if not cp.has_section("keys"):
+        cp.add_section("keys")
+    return cp
+
+
+def save_config_secure(path, cp):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        cp.write(fh)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def fetch_usage(api_key):
+    """Returns (ok, data_or_error_message)."""
+    conn = http.client.HTTPSConnection("opencode.ai", timeout=TIMEOUT)
+    try:
+        conn.request("GET", USAGE_URL.removeprefix("https://opencode.ai"),
+                     headers={"Authorization": f"Bearer {api_key}",
+                              "Accept": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8", "replace")
+        if resp.status != 200:
+            return False, f"HTTP {resp.status}: {raw[:120]}"
+        data = json.loads(raw)
+        return True, data.get("usage", {})
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        conn.close()
+
+
+def fmt_reset(iso):
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.astimezone().strftime("%m-%d %H:%M")
+    except (ValueError, AttributeError):
+        return iso or "—"
+
+
+def pct_color(pct, rate_limited=False):
+    """ANSI color for a percentage cell."""
+    color = "\033[32m" if pct < 60 else ("\033[33m" if pct < 90 else "\033[31m")
+    mark = " ⚠" if rate_limited else ""
+    return f"{color}{pct:3d}%{mark}\033[0m"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--add", metavar="LABEL",
+                    help="prompt for an API key and store it under LABEL")
+    ap.add_argument("--remove", metavar="LABEL", help="delete a stored key")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--config", default=CONFIG, metavar="PATH",
+                    help=f"config file (default {CONFIG})")
+    args = ap.parse_args()
+
+    cp = load_config(args.config)
+    keys = dict(cp["keys"]) if cp.has_section("keys") else {}
+
+    if args.add:
+        if not args.add.isalnum() and "_" not in args.add:
+            ap.error("label must be alphanumeric")
+        try:
+            key = getpass.getpass(f"API key for '{args.add}': ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("no key entered")
+            return 1
+        if not key:
+            print("no key entered")
+            return 1
+        cp["keys"][args.add] = key
+        save_config_secure(args.config, cp)
+        print(f"saved '{args.add}' ({args.config})")
+        return 0
+
+    if args.remove:
+        if args.remove not in keys:
+            print(f"no such label: {args.remove}")
+            return 1
+        del cp["keys"][args.remove]
+        save_config_secure(args.config, cp)
+        print(f"removed '{args.remove}'")
+        return 0
+
+    if not keys:
+        sys.stderr.write(
+            f"error: no keys stored. Add one with: {APP} --add <label>\n")
+        return 2
+
+    results = {}
+    for label, key in keys.items():
+        ok, data = fetch_usage(key)
+        results[label] = data if ok else {"error": data}
+
+    if args.json:
+        print(json.dumps({"usage": results}, ensure_ascii=False, indent=1))
+        return 0 if all("error" not in v for v in results.values()) else 1
+
+    # table header
+    widths = {k: max(len(LIMIT_LABELS[k]), 8) for k in LIMIT_ORDER}
+    header = f"{'account':<10}"
+    for k in LIMIT_ORDER:
+        header += f"  {LIMIT_LABELS[k]:^{widths[k]}}  reset"
+    print(header)
+    print("-" * len(header))
+
+    failed = 0
+    for label in keys:
+        data = results[label]
+        row = f"{label:<10}"
+        if "error" in data:
+            row += f"  ERROR: {data['error']}"
+            failed += 1
+        else:
+            for k in LIMIT_ORDER:
+                item = data.get(k) or {}
+                pct = item.get("percent")
+                if pct is None:
+                    row += f"  {'—':^{widths[k]}}  —"
+                    continue
+                status = item.get("status")
+                cell = pct_color(pct, rate_limited=(status == "rate-limited"))
+                row += f"  {cell:^{widths[k]}}  {fmt_reset(item.get('resetsAt'))}"
+        print(row)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -28,6 +28,7 @@ import getpass
 import http.client
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -85,11 +86,28 @@ def fmt_reset(iso):
         return iso or "—"
 
 
-def pct_color(pct, rate_limited=False):
-    """ANSI color for a percentage cell."""
-    color = "\033[32m" if pct < 60 else ("\033[33m" if pct < 90 else "\033[31m")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def vlen(s):
+    """Visible length of a string, ignoring ANSI escape codes."""
+    return len(ANSI_RE.sub("", s))
+
+
+def pad_center(s, width):
+    """Center a string in `width` columns, counting only visible chars."""
+    pad = max(width - vlen(s), 0)
+    left = pad // 2
+    return " " * left + s + " " * (pad - left)
+
+
+def pct_cell(pct, rate_limited=False, color=True):
+    """Percentage cell, colorized when enabled."""
     mark = " ⚠" if rate_limited else ""
-    return f"{color}{pct:3d}%{mark}\033[0m"
+    if not color:
+        return f"{pct:3d}%{mark}"
+    c = "\033[32m" if pct < 60 else ("\033[33m" if pct < 90 else "\033[31m")
+    return f"{c}{pct:3d}%{mark}\033[0m"
 
 
 def main():
@@ -145,13 +163,16 @@ def main():
         print(json.dumps({"usage": results}, ensure_ascii=False, indent=1))
         return 0 if all("error" not in v for v in results.values()) else 1
 
-    # table header
+    # table: fixed-width columns, aligned by visible character count
     widths = {k: max(len(LIMIT_LABELS[k]), 8) for k in LIMIT_ORDER}
+    reset_w = 11
+    use_color = sys.stdout.isatty()
     header = f"{'account':<10}"
     for k in LIMIT_ORDER:
-        header += f"  {LIMIT_LABELS[k]:^{widths[k]}}  reset"
+        header += (f"  {pad_center(LIMIT_LABELS[k], widths[k])}"
+                   f"  {'reset':^{reset_w}}")
     print(header)
-    print("-" * len(header))
+    print("-" * vlen(header))
 
     failed = 0
     for label in keys:
@@ -165,11 +186,13 @@ def main():
                 item = data.get(k) or {}
                 pct = item.get("percent")
                 if pct is None:
-                    row += f"  {'—':^{widths[k]}}  —"
+                    row += f"  {pad_center('—', widths[k])}  {'—':<{reset_w}}"
                     continue
                 status = item.get("status")
-                cell = pct_color(pct, rate_limited=(status == "rate-limited"))
-                row += f"  {cell:^{widths[k]}}  {fmt_reset(item.get('resetsAt'))}"
+                cell = pct_cell(pct, rate_limited=(status == "rate-limited"),
+                                color=use_color)
+                row += (f"  {pad_center(cell, widths[k])}"
+                        f"  {fmt_reset(item.get('resetsAt')):<{reset_w}}")
         print(row)
     return 1 if failed else 0
 

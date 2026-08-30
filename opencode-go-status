@@ -809,6 +809,9 @@ def cmd_bench(args):
         print(f'reply:    "{reply}"')
     if detail.get("reason"):
         print(f"reason:   {detail['reason']}")
+    if status != "ok" and args.api == "chat" and detail.get("http") == 500:
+        print("hint: this model may use the Responses API — "
+              "retry with --api responses")
     return 0 if status == "ok" else 1
 
 
@@ -862,9 +865,10 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=1024, metavar="N",
                     help="bench: max generation tokens (default 1024; "
                          "reasoning models need budget for content)")
-    ap.add_argument("--api", choices=["chat", "responses"], default="chat",
-                    help="bench API style: chat (default) | responses "
-                         "(muse-spark / gpt-5.6 / grok models on zen)")
+    ap.add_argument("--api", choices=["chat", "responses"],
+                    default=argparse.SUPPRESS,
+                    help="bench API style: auto (default: responses for "
+                         "gpt-/grok-/muse- models, else chat) | chat | responses")
     ap.add_argument("--json", action="store_true",
                     help="bench: emit JSON result instead of a report")
     args = ap.parse_args()
@@ -881,9 +885,14 @@ def main():
         provider = getattr(args, "provider", None) or "go"
         if provider not in PROVIDERS:
             provider = "go"
+        api = getattr(args, "api", None)
+        if api is None:
+            api = ("responses" if model.startswith(("gpt-", "grok-", "muse-"))
+                   else "chat")
+        args.api = api
         args.endpoint = (getattr(args, "endpoint", None)
                          or PROVIDERS[provider]
-                         + ("/responses" if args.api == "responses"
+                         + ("/responses" if api == "responses"
                             else "/chat/completions"))
         return cmd_bench(args)
 

@@ -58,8 +58,8 @@ APP = "opencode-go-status"
 DEFAULT_ENDPOINT = "https://opencode.ai/zen/go/v1/chat/completions"
 DEFAULT_MODEL = "deepseek-v4-flash"
 PROVIDERS = {
-    "go": "https://opencode.ai/zen/go/v1/chat/completions",
-    "zen": "https://opencode.ai/zen/v1/chat/completions",
+    "go": "https://opencode.ai/zen/go/v1",
+    "zen": "https://opencode.ai/zen/v1",
 }
 DEFAULT_LOG = os.path.expanduser("~/opencode-go-status.log")
 CONFIG_DIR = os.path.expanduser("~/.config/opencode-go-status")
@@ -180,9 +180,11 @@ def parse_endpoint(endpoint):
 
 
 def stream_probe(endpoint, model, api_key, timeout, content, max_tokens,
-                 compute_tps=False, track_content_ttft=False):
-    """One streaming chat completion. Returns (status, detail_dict).
+                 compute_tps=False, track_content_ttft=False, api="chat"):
+    """One streaming completion. Returns (status, detail_dict).
 
+    api="chat" speaks /chat/completions (OpenAI-compatible SSE);
+    api="responses" speaks /responses (OpenAI Responses API events).
     detail keys: http, ttfb_ms, ttft_ms (first non-empty delta), latency_ms,
     reason, tps (when compute_tps), ttft_content_ms (when track_content_ttft),
     model, reply, usage. Errors carry reason/http; ok carries reply/usage.
@@ -195,13 +197,18 @@ def stream_probe(endpoint, model, api_key, timeout, content, max_tokens,
     scheme, host, path = parse_endpoint(endpoint)
     conn_cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
     conn = conn_cls(host, timeout=timeout)
-    body = json.dumps({
+    payload = {
         "model": model,
-        "messages": [{"role": "user", "content": content}],
-        "max_tokens": max_tokens,
-        "temperature": 0,
         "stream": True,
-    })
+    }
+    if api == "responses":
+        payload["input"] = content
+        payload["max_output_tokens"] = max_tokens
+    else:
+        payload["messages"] = [{"role": "user", "content": content}]
+        payload["max_tokens"] = max_tokens
+        payload["temperature"] = 0
+    body = json.dumps(payload)
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -237,6 +244,31 @@ def stream_probe(endpoint, model, api_key, timeout, content, max_tokens,
                 chunk = json.loads(payload)
             except ValueError:
                 continue
+            if api == "responses":
+                rtype = chunk.get("type", "")
+                if rtype == "response.output_text.delta":
+                    text = chunk.get("delta")
+                    if text:
+                        if detail["ttft_ms"] is None:
+                            detail["ttft_ms"] = round((time.monotonic() - t0) * 1000)
+                        if first_content_ms is None:
+                            first_content_ms = round((time.monotonic() - t0) * 1000)
+                        reply_parts.append(text)
+                elif rtype == "response.reasoning_text.delta":
+                    if chunk.get("delta") and detail["ttft_ms"] is None:
+                        detail["ttft_ms"] = round((time.monotonic() - t0) * 1000)
+                elif rtype in ("response.completed", "response.incomplete",
+                               "response.failed"):
+                    finished = True
+                    rresp = chunk.get("response") or {}
+                    if rresp.get("usage"):
+                        usage = rresp["usage"]
+                    if rtype != "response.completed":
+                        reason = (rresp.get("incomplete_details")
+                                  or rresp.get("error")
+                                  or rtype)
+                        detail["reason"] = f"{rtype}: {reason}"
+                continue
             if chunk.get("usage"):
                 usage = chunk["usage"]
             choices = chunk.get("choices") or []
@@ -254,8 +286,6 @@ def stream_probe(endpoint, model, api_key, timeout, content, max_tokens,
                 reply_parts.append(token)
             if choices[0].get("finish_reason"):
                 finished = True
-            if chunk.get("usage"):
-                usage = chunk["usage"]
         detail["latency_ms"] = round((time.monotonic() - t0) * 1000)
     except (OSError, http.client.HTTPException) as exc:
         detail["latency_ms"] = round((time.monotonic() - t0) * 1000)
@@ -275,22 +305,29 @@ def stream_probe(endpoint, model, api_key, timeout, content, max_tokens,
         "model": model,
         "reply": reply,
         "usage": {
-            "prompt": usage.get("prompt_tokens"),
-            "completion": usage.get("completion_tokens"),
+            "prompt": (usage.get("prompt_tokens")
+                       if "prompt_tokens" in usage
+                       else usage.get("input_tokens")),
+            "completion": (usage.get("completion_tokens")
+                           if "completion_tokens" in usage
+                           else usage.get("output_tokens")),
             "total": usage.get("total_tokens"),
         },
     })
     if track_content_ttft:
         detail["ttft_content_ms"] = first_content_ms
     if compute_tps:
+        completion = usage.get("completion_tokens")
+        if completion is None:
+            completion = usage.get("output_tokens")
         stream_ms = None
         if (detail["latency_ms"] is not None and detail["ttft_ms"] is not None
                 and detail["latency_ms"] >= detail["ttft_ms"]):
             stream_ms = detail["latency_ms"] - detail["ttft_ms"]
         if stream_ms and stream_ms >= 50 and completion:
             detail["tps"] = round(completion / (stream_ms / 1000), 1)
-        if stream_ms and stream_ms > 0 and completion:
-            detail["tps"] = round(completion / (stream_ms / 1000), 1)
+        if detail["tps"] is not None and detail["tps"] > 500:
+            detail["tps"] = None  # burst-arrival artifact (implausible speed)
     return "ok", detail
 
 
@@ -720,7 +757,8 @@ def cmd_bench(args):
     request_model = bare_model(args.model)
     status, detail = stream_probe(args.endpoint, request_model, api_key,
                                   args.timeout, BENCH_PROMPT, args.max_tokens,
-                                  compute_tps=True, track_content_ttft=True)
+                                  compute_tps=True, track_content_ttft=True,
+                                  api=args.api)
     if args.json:
         out = {
             "ts": now_iso(),
@@ -763,7 +801,7 @@ def cmd_bench(args):
               f"({detail['usage']['completion']} tokens / "
               f"{(detail['latency_ms'] - detail['ttft_ms']) / 1000:.2f}s stream)")
     else:
-        print("tps:      — (usage not reported by the endpoint)")
+        print("tps:      — (not measurable)")
     if detail.get("reply"):
         reply = detail["reply"]
         if len(reply) > 60:
@@ -824,6 +862,9 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=1024, metavar="N",
                     help="bench: max generation tokens (default 1024; "
                          "reasoning models need budget for content)")
+    ap.add_argument("--api", choices=["chat", "responses"], default="chat",
+                    help="bench API style: chat (default) | responses "
+                         "(muse-spark / gpt-5.6 / grok models on zen)")
     ap.add_argument("--json", action="store_true",
                     help="bench: emit JSON result instead of a report")
     args = ap.parse_args()
@@ -841,7 +882,9 @@ def main():
         if provider not in PROVIDERS:
             provider = "go"
         args.endpoint = (getattr(args, "endpoint", None)
-                         or PROVIDERS[provider])
+                         or PROVIDERS[provider]
+                         + ("/responses" if args.api == "responses"
+                            else "/chat/completions"))
         return cmd_bench(args)
 
     if args.setup:
@@ -879,7 +922,7 @@ def main():
     opt["log_max_mb"] = float(opt["log_max_mb"])
     opt["provider"] = opt["provider"] if opt["provider"] in PROVIDERS else "go"
     if getattr(args, "endpoint", None) is None and not cfg.get("endpoint"):
-        opt["endpoint"] = PROVIDERS[opt["provider"]]
+        opt["endpoint"] = PROVIDERS[opt["provider"]] + "/chat/completions"
     notify_mode = opt["notify"]
     if notify_mode not in ("change", "always", "off"):
         notify_mode = "change"
